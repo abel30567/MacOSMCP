@@ -1,0 +1,18 @@
+node_modules
+dist
+.DS_Store
+*.tsbuildinfo
+
+# Environment files (keep the example)
+.env*
+!.env.example
+
+# Logs and local runtime state
+*.log
+.macos-mcp/
+browser-profiles/
+coverage/
+
+# Defensive: personal scratch scripts and task notes
+/*.cjs
+EXPEDIA_TASK.md
