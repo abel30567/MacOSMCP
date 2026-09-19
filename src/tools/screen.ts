@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { defineTool } from './define-tool.js'
+import { type OcrBox, buildKeystrokeCommand, ocrCenter } from './keys.js'
 
 const exec = promisify(execFile)
 
@@ -76,7 +77,7 @@ export function registerScreenTools(server: McpServer): void {
 	defineTool(server, {
 		name: 'mac_screen_ocr',
 		description:
-			'Capture a screenshot and perform OCR using macOS Vision framework. Returns recognized text.',
+			'Capture a screenshot and perform OCR using macOS Vision framework. Returns each text line with the screen-point x,y of its center (usable directly with mac_click).',
 		schema: {
 			region: z.string().optional().describe('Region as "x,y,width,height" (e.g. "0,0,800,600")'),
 		},
@@ -95,31 +96,47 @@ export function registerScreenTools(server: McpServer): void {
 					ObjC.import('Vision')
 					ObjC.import('AppKit')
 					const img = $.NSImage.alloc.initWithContentsOfFile('${tmpPath}')
-					const cgImg = img.CGImageForProposedRectContextHints(null, null, null)
+					// $() is nil — a JS null would be bridged as NSNull and crash Vision
+					const cgImg = img.CGImageForProposedRectContextHints(null, $(), $())
 					const req = $.VNRecognizeTextRequest.alloc.init
 					req.recognitionLevel = $.VNRequestTextRecognitionLevelAccurate
-					const handler = $.VNImageRequestHandler.alloc.initWithCGImageOptions(cgImg, null)
-					handler.performRequestsError([req], null)
+					const handler = $.VNImageRequestHandler.alloc.initWithCGImageOptions(cgImg, $.NSDictionary.dictionary)
+					handler.performRequestsError($.NSArray.arrayWithObject(req), null)
 					const results = req.results
-					const lines = []
+					const boxes = []
 					for (let i = 0; i < results.count; i++) {
 						const obs = results.objectAtIndex(i)
-						const candidate = obs.topCandidates(1).objectAtIndex(0)
-						lines.push(candidate.string.js)
+						const b = obs.boundingBox
+						boxes.push({
+							text: obs.topCandidates(1).objectAtIndex(0).string.js,
+							x: b.origin.x, y: b.origin.y, w: b.size.width, h: b.size.height,
+						})
 					}
-					JSON.stringify(lines)
+					const f = $.NSScreen.mainScreen.frame
+					JSON.stringify({ boxes, screen: { w: f.size.width, h: f.size.height } })
 				`
 
 				const { stdout } = await exec('osascript', ['-l', 'JavaScript', '-e', jxaScript], {
 					timeout: 30000,
 				})
 
-				const text = JSON.parse(stdout.trim()) as string[]
+				const { boxes, screen } = JSON.parse(stdout.trim()) as {
+					boxes: OcrBox[]
+					screen: { w: number; h: number }
+				}
+				const [rx, ry, rw, rh] = args.region?.split(',').map(Number) ?? []
+				const region = args.region
+					? { x: rx, y: ry, w: rw, h: rh }
+					: { x: 0, y: 0, w: screen.w, h: screen.h }
+				const lines = boxes.map((b) => ({ text: b.text, ...ocrCenter(b, region) }))
 				return {
 					content: [
 						{
 							type: 'text',
-							text: JSON.stringify({ lines: text, full_text: text.join('\n') }),
+							text: JSON.stringify({
+								lines,
+								full_text: lines.map((l) => l.text).join('\n'),
+							}),
 						},
 					],
 				}
@@ -263,29 +280,111 @@ export function registerScreenTools(server: McpServer): void {
 	})
 
 	defineTool(server, {
+		name: 'mac_chrome_open',
+		description:
+			'Open a URL in a plain Google Chrome window on a named persistent profile — no debug port, no automation flags. Shares profiles with mac_browser_launch labels. Drive it with mac_click / mac_keystroke / mac_screen_ocr. Use for sites whose bot detection flags CDP-driven browsers.',
+		schema: {
+			label: z
+				.string()
+				.regex(/^[a-zA-Z0-9_-]+$/)
+				.describe('Profile label (same namespace as mac_browser_launch)'),
+			url: z.string().url().describe('URL to open'),
+		},
+		scope: ['system'],
+		risk: 'med',
+		handler: async (args) => {
+			const userDataDir = `${process.env.HOME}/.macos-mcp/browser-profiles/${args.label}`
+			const findMain = async () => {
+				const { stdout } = await exec('ps', ['-axo', 'pid=,command='])
+				return stdout
+					.split('\n')
+					.filter(
+						(l) =>
+							l.includes(`--user-data-dir=${userDataDir} `) ||
+							l.endsWith(`--user-data-dir=${userDataDir}`),
+					)
+					.filter((l) => !l.includes('Helper'))
+			}
+
+			if ((await findMain()).some((l) => l.includes('--remote-debugging'))) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: JSON.stringify({
+								error: 'profile_in_cdp_session',
+								message: `Profile "${args.label}" is open under mac_browser_launch. Close it with mac_browser_close first.`,
+							}),
+						},
+					],
+				}
+			}
+
+			await exec(
+				'open',
+				[
+					'-na',
+					'Google Chrome',
+					'--args',
+					`--user-data-dir=${userDataDir}`,
+					'--no-first-run',
+					'--no-default-browser-check',
+					args.url,
+				],
+				{ timeout: 10000 },
+			)
+
+			// Two Chrome instances share one app name, so focus this one by pid.
+			await new Promise((r) => setTimeout(r, 1500))
+			const pid = (await findMain())[0]?.trim().split(/\s+/)[0]
+			if (pid) {
+				await exec('osascript', [
+					'-e',
+					`tell application "System Events" to set frontmost of (first process whose unix id is ${pid}) to true`,
+				])
+			}
+
+			return {
+				content: [
+					{
+						type: 'text',
+						text: JSON.stringify({ ok: true, label: args.label, url: args.url, pid: pid ?? null }),
+					},
+				],
+			}
+		},
+	})
+
+	defineTool(server, {
 		name: 'mac_keystroke',
 		description: 'Simulate keyboard input on macOS via AppleScript System Events.',
 		schema: {
-			keys: z.string().describe('Keys to type or key code name (e.g. "hello" or "return")'),
+			keys: z
+				.string()
+				.describe(
+					'Text to type, or a named key sent as a key code: return, enter, tab, space, delete, forwarddelete, escape, left, right, up, down, home, end, pageup, pagedown',
+				),
 			modifiers: z
 				.array(z.enum(['command', 'option', 'control', 'shift']))
 				.optional()
 				.describe('Modifier keys to hold'),
 			app: z.string().optional().describe('Target application name'),
+			human: z
+				.boolean()
+				.optional()
+				.default(false)
+				.describe('Type text one character at a time with randomized human-like delays'),
 		},
 		scope: ['system'],
 		risk: 'high',
 		handler: async (args) => {
-			const modStr = args.modifiers?.length
-				? ` using {${args.modifiers.map((m) => `${m} down`).join(', ')}}`
-				: ''
-
-			const keystrokeCmd = `keystroke "${args.keys.replace(/"/g, '\\"')}"${modStr}`
+			const keystrokeCmd = buildKeystrokeCommand(args.keys, args.modifiers, args.human)
+			const events = `tell application "System Events"\n${keystrokeCmd}\nend tell`
 			const script = args.app
-				? `tell application "${args.app}" to activate\ndelay 0.3\ntell application "System Events" to ${keystrokeCmd}`
-				: `tell application "System Events" to ${keystrokeCmd}`
+				? `tell application "${args.app}" to activate\ndelay 0.3\n${events}`
+				: events
 
-			await exec('osascript', ['-e', script], { timeout: 10000 })
+			await exec('osascript', ['-e', script], { timeout: 60000 })
 			return {
 				content: [
 					{
@@ -309,13 +408,22 @@ export function registerScreenTools(server: McpServer): void {
 				.default('left')
 				.describe('Mouse button'),
 			double: z.boolean().optional().default(false).describe('Double click'),
+			human: z
+				.boolean()
+				.optional()
+				.default(false)
+				.describe('Glide the pointer to the target with easing and pause before clicking'),
 		},
 		scope: ['system'],
 		risk: 'high',
 		handler: async (args) => {
 			const action = args.double ? 'dc' : args.button === 'right' ? 'rc' : 'c'
 			try {
-				await exec('cliclick', [`${action}:${args.x},${args.y}`], { timeout: 5000 })
+				const at = `${args.x},${args.y}`
+				const cliArgs = args.human
+					? ['-e', '400', `m:${at}`, 'w:300', `${action}:${at}`]
+					: [`${action}:${at}`]
+				await exec('cliclick', cliArgs, { timeout: 10000 })
 				return {
 					content: [
 						{
