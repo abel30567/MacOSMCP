@@ -232,11 +232,12 @@ describe('MCP Protocol', () => {
 		expect(toolNames).toContain('mac_clipboard_set')
 		expect(toolNames).toContain('mac_notification')
 		expect(toolNames).toContain('mac_open')
+		expect(toolNames).toContain('mac_chrome_open')
 		expect(toolNames).toContain('mac_keystroke')
 		expect(toolNames).toContain('mac_click')
 		expect(toolNames).toContain('mac_app_list')
 		expect(toolNames).toContain('mac_app_activate')
-		expect(toolNames.length).toBe(25)
+		expect(toolNames.length).toBe(26)
 	})
 })
 

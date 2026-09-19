@@ -50,7 +50,7 @@ if (isStdio) {
 			ok: true,
 			version: '0.1.0',
 			uptime: process.uptime(),
-			tools: 25,
+			tools: 26,
 		})
 	})
 
